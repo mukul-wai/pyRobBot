@@ -71,7 +71,13 @@ class VoiceChat(Chat):
         self.mixer.init()
         chime.theme("big-sur")
 
+        # Flag to stop the assistant from talking
+        self._stop = False
+        stop_words = ["ok cancel", "ok stop"]
+        self.stop_words = [self._translate(word) for word in stop_words]
+
         # Create queues for TTS processing and speech playing
+        self.questions_queue = queue.Queue()
         self.tts_conversion_queue = queue.Queue()
         self.play_speech_queue = queue.Queue()
         # Create threads to watch the TTS and speech playing queues
@@ -81,108 +87,119 @@ class VoiceChat(Chat):
         self.play_speech_thread = threading.Thread(
             target=self.speak, args=(self.play_speech_queue,), daemon=True
         )
+        self.stop_words_watcher_thread = threading.Thread(
+            target=self.listen_daemon, daemon=True
+        )
+
         self.tts_conversion_watcher_thread.start()
         self.play_speech_thread.start()
+        self.stop_words_watcher_thread.start()
 
-    def start(self):  # noqa: PLR0912, PLR0915
+    def start(self):
         """Start the chat."""
         # ruff: noqa: T201
         if not self.skip_initial_greeting:
             self.tts_conversion_queue.put(self.initial_greeting)
 
         try:
-            previous_question_answered = True
+            previous_question = None
             while True:
-                # Wait for all items in the queue to be processed
+                # Wait for all items in the playing queue to be processed
                 self.tts_conversion_queue.join()
                 self.play_speech_queue.join()
-                if previous_question_answered:
+                if previous_question is None or previous_question:
                     chime.warning()
-                    previous_question_answered = False
+                    previous_question = False
                     logger.debug(f"{self.assistant_name}> Listening...")
 
-                question = self.listen().strip()
-                if not question:
-                    continue
-                logger.debug(f"{self.assistant_name}> Heard: '{question}'")
-
-                # Check for the exit expressions
-                if any(
-                    _get_lower_alphanumeric(question).startswith(
-                        _get_lower_alphanumeric(expr)
-                    )
-                    for expr in self.exit_expressions
-                ):
-                    chime.theme("material")
-                    chime.error()
-                    logger.debug(f"{self.assistant_name}> Goodbye!")
-                    break
-
-                chime.success()
-                logger.debug(f"{self.assistant_name}> Getting response...")
-                sentence = ""
-                inside_code_block = False
-                at_least_one_code_line_written = False
-                for answer_chunk in self.respond_user_prompt(prompt=question):
-                    fmtd_chunk = answer_chunk.strip(" \n")
-                    code_block_start_detected = fmtd_chunk.startswith("``")
-
-                    if code_block_start_detected and not inside_code_block:
-                        # Toggle the code block state
-                        inside_code_block = True
-
-                    if inside_code_block:
-                        code_chunk = answer_chunk
-                        if at_least_one_code_line_written:
-                            inside_code_block = not fmtd_chunk.endswith("``")  # Code ends
-                            if not inside_code_block:
-                                code_chunk = answer_chunk.rstrip("`") + "```\n"
-                        print(
-                            code_chunk,
-                            end="" if inside_code_block else "\n",
-                            flush=True,
-                        )
-                        at_least_one_code_line_written = True
-                    else:
-                        # The answer chunk is to be spoken
-                        sentence += answer_chunk
-                        if answer_chunk.strip().endswith(("?", "!", ".")):
-                            # Send sentence for TTS even if the request hasn't finished
-                            self.tts_conversion_queue.put(sentence)
-                            sentence = ""
-
-                if sentence:
-                    self.tts_conversion_queue.put(sentence)
-
-                if at_least_one_code_line_written:
-                    spoken_info_to_user = "The code has been written to the console"
-                    spoken_info_to_user = self._translate(spoken_info_to_user)
-                    self.tts_conversion_queue.put(spoken_info_to_user)
-
-                previous_question_answered = True
-
+                try:
+                    question = self.questions_queue.get()
+                    if question is None:
+                        break
+                    self.answer_question(question)
+                    previous_question = question
+                finally:
+                    self.questions_queue.task_done()
         except (KeyboardInterrupt, EOFError):
             chime.info()
+        else:
+            chime.theme("material")
+            chime.error()
+            logger.debug(f"{self.assistant_name}> Goodbye!")
         finally:
-            logger.debug("Leaving chat: {}")
+            logger.debug("Leaving chat")
+
+    def answer_question(self, question):
+        if not question.strip():
+            return
+
+        chime.success()
+        logger.debug(
+            f"{self.assistant_name}> Getting response for prompt '{question}'..."
+        )
+
+        sentence = ""
+        inside_code_block = False
+        at_least_one_code_line_written = False
+        for answer_chunk in self.respond_user_prompt(prompt=question):
+            if self._stop:
+                return
+
+            fmtd_chunk = answer_chunk.strip(" \n")
+            code_block_start_detected = fmtd_chunk.startswith("``")
+
+            if code_block_start_detected and not inside_code_block:
+                # Toggle the code block state
+                inside_code_block = True
+
+            if inside_code_block:
+                code_chunk = answer_chunk
+                if at_least_one_code_line_written:
+                    inside_code_block = not fmtd_chunk.endswith("``")  # Code ends
+                    if not inside_code_block:
+                        code_chunk = answer_chunk.rstrip("`") + "```\n"
+                print(
+                    code_chunk,
+                    end="" if inside_code_block else "\n",
+                    flush=True,
+                )
+                at_least_one_code_line_written = True
+            else:
+                # The answer chunk is to be spoken
+                sentence += answer_chunk
+                if answer_chunk.strip().endswith(("?", "!", ".")):
+                    # Send sentence for TTS even if the request hasn't finished
+                    self.tts_conversion_queue.put(sentence)
+                    sentence = ""
+
+        if not self._stop:
+            if sentence:
+                self.tts_conversion_queue.put(sentence)
+            if at_least_one_code_line_written:
+                spoken_info_to_user = "The code has been written to the console"
+                spoken_info_to_user = self._translate(spoken_info_to_user)
+                self.tts_conversion_queue.put(spoken_info_to_user)
 
     def get_tts(self, text_queue: queue.Queue):
         """Convert text to a pygame Sound object."""
         while True:
             try:
                 text = text_queue.get()
-                logger.debug("Received for {} TTS: '{}'", self.tts_engine, text)
-
-                if self.tts_engine == "openai" and _pydub_imported:
-                    tts_wav_buffer = self._tts_openai(text)
+                if self._stop:
+                    logger.debug("Asked to stop. NOT doing TTS for '{}'", text)
                 else:
-                    tts_wav_buffer = self._tts_google(text)
+                    logger.debug("Received for {} TTS: '{}'", self.tts_engine, text)
 
-                # Convert wav buffer to sound
-                speech_sound = self._wav_buffer_to_sound(wav_buffer=tts_wav_buffer)
-                self.play_speech_queue.put(speech_sound)
+                    if self.tts_engine == "openai" and _pydub_imported:
+                        tts_wav_buffer = self._tts_openai(text)
+                    else:
+                        tts_wav_buffer = self._tts_google(text)
 
-                logger.debug("Done with TTS for '{}'", text)
+                    # Convert wav buffer to sound
+                    speech_sound = self._wav_buffer_to_sound(wav_buffer=tts_wav_buffer)
+                    self.play_speech_queue.put(speech_sound)
+
+                    logger.debug("Done with TTS for '{}'", text)
             except Exception as error:  # noqa: PERF203, BLE001
                 logger.opt(exception=True).debug(error)
                 logger.error(error)
@@ -194,13 +211,37 @@ class VoiceChat(Chat):
         while True:
             try:
                 sound = sound_obj_queue.get()
-                _channel = sound.play()
-                while self._assistant_still_talking():
-                    self.pygame.time.wait(100)
+                if self._stop:
+                    sound.stop()
+                else:
+                    sound.play()
+                    while self._assistant_still_talking():
+                        self.pygame.time.wait(150)
             except Exception as error:  # noqa: PERF203, BLE001
                 logger.exception(error)
             finally:
                 sound_obj_queue.task_done()
+
+    def listen_daemon(self):
+        """Watch for stop words."""
+        # Check for the exit expressions
+        while True:
+            try:
+                text = self.listen().strip().lower()
+                simplified_text = _get_lower_alphanumeric(text)
+                if any(word in simplified_text for word in self.stop_words):
+                    logger.debug("Asked to stop")
+                    self._stop = True
+                elif any(
+                    simplified_text.startswith(_get_lower_alphanumeric(expr))
+                    for expr in self.exit_expressions
+                ):
+                    self.questions_queue.put(None)
+                elif not self._assistant_still_talking():
+                    self._stop = False
+                    self.questions_queue.put(text)
+            except Exception as error:
+                logger.exception(error)
 
     def listen(self):
         """Record audio from the microphone, until user stops, and convert it to text."""

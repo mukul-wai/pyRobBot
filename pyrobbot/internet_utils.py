@@ -91,7 +91,7 @@ def raw_websearch(
             except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
                 continue
             else:
-                content_type = response.headers.get("content-type")
+                content_type = response.headers.get("content-type", "")
                 if "text/html" not in content_type:
                     continue
                 html = unidecode(extract_text_from_html(response.text))

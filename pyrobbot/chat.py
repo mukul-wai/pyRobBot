@@ -368,8 +368,9 @@ class Chat(AlternativeConstructors):
         prompt_as_msg = {"role": role.lower().strip(), "content": prompt.strip()}
         yield from self.yield_response_from_msg(prompt_as_msg, **kwargs)
 
-    def _translate(self, text):
-        lang = self.language
+    def _translate(self, text, lang: str = None):
+        if lang is None:
+            lang = self.language
 
         cached_translation = type(self)._translation_cache[text].get(lang)  # noqa SLF001
         if cached_translation:
